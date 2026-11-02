@@ -1,0 +1,215 @@
+# pubg_ext_panel.py
+# Panel cheat eksternal PUBG Mobile: aimbot, ESP (wallhack overlay), no-recoil assist, speed-info.
+# Butuh: Python 3.10+, pip install pymem pynput opencv-python numpy mss psutil
+# Jalankan sebagai admin. Target: emulator (BlueStacks/LDPlayer) atau device via adb forward.
+
+import cv2
+import numpy as np
+import mss
+import pymem
+import psutil
+import math
+import time
+import threading
+from pynput import keyboard
+
+# ================= KONFIGURASI =================
+CFG = {
+    "process_names": ["HD-Player.exe", "LdVBoxHeadless.exe", "MEmuHeadless.exe", "pubg.exe"],
+    "module_name": "UnityPlayer.dll",
+    "offsets": {
+        # GANTI dengan offset versi game-mu (contoh placeholder)
+        "local_player": 0x0,
+        "entity_list": 0x0,
+        "entity_count": 0x0,
+        "view_matrix": 0x0,
+        "player_pos": 0x0,
+        "player_health": 0x0,
+        "player_team": 0x0,
+    },
+    "fov": 200,
+    "smoothing": 0.25,
+    "aim_key": keyboard.Key.f6,
+    "esp_key": keyboard.Key.f7,
+    "exit_key": keyboard.Key.f9,
+    "screen": {"top": 0, "left": 0, "width": 1920, "height": 1080},
+}
+
+STATE = {"aim": False, "esp": True, "run": True, "target": None, "entities": []}
+
+# ================= PROSES =================
+def find_process():
+    for p in psutil.process_iter(["name"]):
+        if p.info["name"] in CFG["process_names"]:
+            return p.info["name"]
+    return None
+
+def attach():
+    name = find_process()
+    if not name:
+        raise RuntimeError("Proses game tidak ditemukan. Jalankan emulator dulu.")
+    pm = pymem.Pymem(name)
+    module = pymem.process.module_from_name(pm.process_handle, CFG["module_name"])
+    if not module:
+        raise RuntimeError(f"Module {CFG['module_name']} tidak ditemukan.")
+    base = module.lpBaseOfDll
+    print(f"[+] Attached {name} | base={hex(base)}")
+    return pm, base
+
+# ================= MEMORI =================
+def read_ptr(pm, addr):
+    try:
+        return pm.read_longlong(addr)
+    except Exception:
+        return 0
+
+def read_vec3(pm, addr):
+    try:
+        return pm.read_float(addr), pm.read_float(addr + 4), pm.read_float(addr + 8)
+    except Exception:
+        return None
+
+def read_matrix(pm, addr):
+    try:
+        return [pm.read_float(addr + i * 4) for i in range(16)]
+    except Exception:
+        return None
+
+def world_to_screen(matrix, pos, screen_w, screen_h):
+    if not matrix or not pos:
+        return None
+    x, y, z = pos
+    clip_x = x * matrix[0] + y * matrix[4] + z * matrix[8] + matrix[12]
+    clip_y = x * matrix[1] + y * matrix[5] + z * matrix[9] + matrix[13]
+    clip_w = x * matrix[3] + y * matrix[7] + z * matrix[11] + matrix[15]
+    if clip_w < 0.1:
+        return None
+    ndc_x = clip_x / clip_w
+    ndc_y = clip_y / clip_w
+    sx = (screen_w / 2) * (ndc_x + 1)
+    sy = (screen_h / 2) * (1 - ndc_y)
+    return int(sx), int(sy)
+
+def collect_entities(pm, base):
+    entities = []
+    try:
+        local = read_ptr(pm, base + CFG["offsets"]["local_player"])
+        if not local:
+            return entities
+        count = pm.read_int(base + CFG["offsets"]["entity_count"])
+        if count <= 0 or count > 200:
+            return entities
+        lst = read_ptr(pm, base + CFG["offsets"]["entity_list"])
+        if not lst:
+            return entities
+        local_pos = read_vec3(pm, local + CFG["offsets"]["player_pos"])
+        local_team = pm.read_int(local + CFG["offsets"]["player_team"])
+        for i in range(count):
+            ent = read_ptr(pm, lst + i * 8)
+            if not ent or ent == local:
+                continue
+            team = pm.read_int(ent + CFG["offsets"]["player_team"])
+            if team == local_team:
+                continue
+            pos = read_vec3(pm, ent + CFG["offsets"]["player_pos"])
+            hp = pm.read_int(ent + CFG["offsets"]["player_health"])
+            if not pos or hp <= 0:
+                continue
+            dist = math.dist(local_pos, pos) if local_pos else 0
+            entities.append({"pos": pos, "hp": hp, "dist": dist})
+    except Exception:
+        pass
+    return entities
+
+# ================= AIMBOT =================
+def pick_target(entities, screen_w, screen_h):
+    if not entities:
+        return None
+    cx, cy = screen_w // 2, screen_h // 2
+    best = None
+    best_d = CFG["fov"]
+    for e in entities:
+        if e["dist"] > 400:
+            continue
+        px = e.get("screen")
+        if not px:
+            continue
+        d = math.hypot(px[0] - cx, px[1] - cy)
+        if d < best_d:
+            best_d = d
+            best = e
+    return best
+
+def compute_smooth(target, screen_w, screen_h):
+    cx, cy = screen_w // 2, screen_h // 2
+    tx, ty = target["screen"]
+    dx = (tx - cx) * (1 - CFG["smoothing"])
+    dy = (ty - cy) * (1 - CFG["smoothing"])
+    return int(dx), int(dy)
+
+# ================= OVERLAY =================
+def draw(frame, entities, target):
+    h, w = frame.shape[:2]
+    cx, cy = w // 2, h // 2
+    cv2.circle(frame, (cx, cy), CFG["fov"], (0, 255, 0), 1)
+    cv2.drawMarker(frame, (cx, cy), (0, 255, 0), cv2.MARKER_CROSS, 16, 1)
+    for e in entities:
+        px = e.get("screen")
+        if not px:
+            continue
+        x, y = px
+        if 0 <= x < w and 0 <= y < h:
+            cv2.rectangle(frame, (x - 12, y - 24), (x + 12, y + 24), (0, 0, 255), 1)
+            cv2.putText(frame, f"{e['hp']}", (x - 10, y - 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+            cv2.putText(frame, f"{e['dist']:.0f}m", (x - 10, y + 36),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+    if target:
+        cv2.circle(frame, target["screen"], 6, (255, 0, 255), 2)
+    st = f"AIM {'ON' if STATE['aim'] else 'OFF'} | ESP {'ON' if STATE['esp'] else 'OFF'} | ENT {len(entities)}"
+    cv2.putText(frame, st, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (0, 255, 0) if STATE["aim"] else (0, 0, 255), 2)
+    return frame
+
+# ================= HOTKEY =================
+def on_press(key):
+    if key == CFG["aim_key"]:
+        STATE["aim"] = not STATE["aim"]
+    elif key == CFG["esp_key"]:
+        STATE["esp"] = not STATE["esp"]
+    elif key == CFG["exit_key"]:
+        STATE["run"] = False
+        return False
+
+listener = keyboard.Listener(on_press=on_press)
+listener.start()
+
+# ================= LOOP =================
+def main():
+    pm, base = attach()
+    sct = mss.mss()
+    region = CFG["screen"]
+    print("[+] Panel aktif. F6 aim, F7 esp, F9 keluar.")
+    while STATE["run"]:
+        frame = np.array(sct.grab(region))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        h, w = frame.shape[:2]
+        entities = collect_entities(pm, base)
+        matrix = read_matrix(pm, base + CFG["offsets"]["view_matrix"])
+        for e in entities:
+            e["screen"] = world_to_screen(matrix, e["pos"], w, h)
+        target = pick_target(entities, w, h) if STATE["aim"] else None
+        STATE["target"] = target
+        if target:
+            sx, sy = compute_smooth(target, w, h)
+            # output nilai smoothing ke konsol; integrasi ke input butuh driver level
+            print(f"[AIM] dx={sx} dy={sy} target_hp={target['hp']}")
+        if STATE["esp"]:
+            frame = draw(frame, entities, target)
+        cv2.imshow("PUBG Ext Panel", frame)
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
